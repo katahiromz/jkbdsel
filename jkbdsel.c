@@ -296,6 +296,7 @@ VOID NTAPI NtProcessStartup(PPEB Peb)
     Print(L"    Space key           : 101 English keyboard\n");
     Print(L"    S key               : Other keyboard\n\n");
     Print(L"  F3 : skip (ask again at next boot)\n");
+    Print(L"  (No input for 30 seconds: skip automatically)\n");
 
     c = WaitForChoice();
     if (c == C_SKIP || c == C_NONE)
