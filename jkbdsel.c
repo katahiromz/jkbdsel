@@ -170,6 +170,17 @@ static BOOLEAN IsDone(void)
     return done;
 }
 
+static BOOLEAN WriteDone(void)
+{
+    HANDLE h;
+    if (!NT_SUCCESS(OpenKey(DONE_KEY, TRUE, &h)))
+        return FALSE;
+    SetDword(h, L"Done", 1);
+    NtFlushKey(h);
+    NtClose(h);
+    return TRUE;
+}
+
 static BOOLEAN Apply(CHOICE c)
 {
     HANDLE h;
@@ -192,11 +203,7 @@ static BOOLEAN Apply(CHOICE c)
     NtFlushKey(h);
     NtClose(h);
 
-    if (!NT_SUCCESS(OpenKey(DONE_KEY, TRUE, &h)))
-        return FALSE;
-    SetDword(h, L"Done", 1);
-    NtFlushKey(h);
-    NtClose(h);
+    WriteDone();
     return TRUE;
 }
 
@@ -296,9 +303,14 @@ VOID NTAPI NtProcessStartup(PPEB Peb)
     Print(L"    Space key           : 101 English keyboard\n");
     Print(L"    S key               : Other keyboard\n\n");
     Print(L"  F3 : skip (ask again at next boot)\n");
+    Print(L"\n");
     Print(L"  (No input for 30 seconds: skip automatically)\n");
 
     c = WaitForChoice();
+
+    if (c == C_SKIP)
+        WriteDone();
+
     if (c == C_SKIP || c == C_NONE)
         goto quit;
 
