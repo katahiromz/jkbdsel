@@ -4,20 +4,25 @@
  * License: MIT or GPL
  *
  * This application is launched via the BootExecute value of smss.exe.
- * It does not use Win32 API.
+ * This application does not use Win32 API.
  *   Hankaku/Zenkaku (scancode 0x29) : 106 Japanese keyboard
  *   Space           (scancode 0x39) : 101 English keyboard
  *   S               (scancode 0x1F) : Other keyboard
  *   F3              (scancode 0x3D) : Skip
  *
+ * It times out after 30 seconds.
+ * If F3 is pressed or no key is pressed for 30 seconds, this app is skipped
+ * and will not ask again (HKLM\SYSTEM\CurrentControlSet\Control\JKBDSEL\Done=1).
+ * To show this screen again, delete that "Done" value.
+ *
  * boot/bootdata/hivesys.inf:
  * HKLM,"SYSTEM\CurrentControlSet\Control\Session Manager","BootExecute",0x00010000,"autocheck autochk *","jkbdsel"
  */
-#include <stdio.h>
 #define WIN32_NO_STATUS
 #include <windef.h>
 #include <winbase.h>
 #include <winnt.h>
+#include <wchar.h>
 #define NTOS_MODE_USER
 #include <ndk/ntndk.h>
 
@@ -36,13 +41,20 @@ typedef struct tagKBD_INPUT_DATA
 #define PARAMS_KEY L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\i8042prt\\Parameters"
 #define DONE_KEY   L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\JKBDSEL"
 
-typedef enum { C_NONE, C_106, C_101, C_OTHER, C_SKIP } CHOICE;
+typedef enum { C_106, C_101, C_OTHER, C_SKIP, C_TIMEOUT, C_ERROR } CHOICE;
 
 static void Print(PCWSTR s)
 {
     UNICODE_STRING us;
     RtlInitUnicodeString(&us, s);
     NtDisplayString(&us);
+}
+
+static void Delay(ULONG ms)
+{
+    LARGE_INTEGER t;
+    t.QuadPart = -(LONGLONG)ms * 10000LL; /* negative value = relative */
+    NtDelayExecution(FALSE, &t);
 }
 
 /* ---------- Registry ---------- */
@@ -102,8 +114,7 @@ static BOOLEAN FileExists(PCWSTR path)
 
 static BOOLEAN IsUnattended(void)
 {
-    return FileExists(L"\\SystemRoot\\unattend.inf") ||
-           FileExists(L"\\SystemRoot\\system32\\unattend.inf");
+    return FileExists(L"\\SystemRoot\\unattend.inf");
 }
 
 #define NLS_LANG_KEY \
@@ -203,8 +214,7 @@ static BOOLEAN Apply(CHOICE c)
     NtFlushKey(h);
     NtClose(h);
 
-    WriteDone();
-    return TRUE;
+    return WriteDone();
 }
 
 /* ---------- Key Input ---------- */
@@ -215,12 +225,13 @@ static CHOICE WaitForChoice(void)
 {
     UNICODE_STRING name;
     OBJECT_ATTRIBUTES oa;
-    IO_STATUS_BLOCK iosb, cancelIosb;
+    static IO_STATUS_BLOCK iosb;
+    static KBD_INPUT_DATA kd;
+    IO_STATUS_BLOCK cancelIosb;
     HANDLE hKbd = NULL, hEvent = NULL;
-    KBD_INPUT_DATA kd;
     LARGE_INTEGER deadline;
     NTSTATUS st;
-    CHOICE ret = C_SKIP;
+    CHOICE ret = C_ERROR;
 
     RtlInitUnicodeString(&name, L"\\Device\\KeyboardClass0");
     InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
@@ -230,13 +241,13 @@ static CHOICE WaitForChoice(void)
                       FILE_SHARE_READ | FILE_SHARE_WRITE,
                       FILE_OPEN, 0, NULL, 0);
     if (!NT_SUCCESS(st))
-        return C_SKIP;
+        return C_ERROR;
 
     st = NtCreateEvent(&hEvent, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE);
     if (!NT_SUCCESS(st))
     {
         NtClose(hKbd);
-        return C_SKIP;
+        return C_ERROR;
     }
 
     NtQuerySystemTime(&deadline);
@@ -253,9 +264,12 @@ static CHOICE WaitForChoice(void)
             st = NtWaitForSingleObject(hEvent, FALSE, &deadline);
             if (st == STATUS_TIMEOUT)
             {
+                LARGE_INTEGER t;
+                t.QuadPart = -3LL * 10000000LL;
+
                 NtCancelIoFile(hKbd, &cancelIosb);
-                NtWaitForSingleObject(hEvent, FALSE, NULL);
-                ret = C_SKIP;
+                NtWaitForSingleObject(hEvent, FALSE, &t);
+                ret = C_TIMEOUT;
                 break;
             }
             st = iosb.Status;
@@ -293,25 +307,41 @@ VOID NTAPI NtProcessStartup(PPEB Peb)
 {
     CHOICE c;
 
-    if (!IsJapaneseSystem() || IsUnattended() || IsDone())
+    UNREFERENCED_PARAMETER(Peb);
+
+    if (!IsJapaneseSystem())
         goto quit;
+
+    if (IsDone())
+        goto quit;
+
+    if (IsUnattended())
+    {
+        Print(L"JKBDSEL: Detected unattended\n");
+        WriteDone();
+        Delay(300);
+        goto quit;
+    }
 
     Print(L"\n\n  ReactOS Setup - Japanese Keyboard Type\n");
     Print(L"  -----------------------------\n\n");
     Print(L"  Press one of the following keys to identify your keyboard.\n\n");
     Print(L"    Hankaku/Zenkaku key : 106 Japanese keyboard\n");
     Print(L"    Space key           : 101 English keyboard\n");
-    Print(L"    S key               : Other keyboard\n\n");
-    Print(L"  F3 : skip (ask again at next boot)\n");
+    Print(L"    S key               : Other keyboard (use default)\n\n");
+    Print(L"  F3 : Skip (will not ask again)\n");
     Print(L"\n");
-    Print(L"  (No input for 30 seconds: skip automatically)\n");
+    Print(L"  (No input for 30 seconds: skip and will not ask again)\n");
 
     c = WaitForChoice();
 
-    if (c == C_SKIP)
+    if (c == C_TIMEOUT || c == C_SKIP)
+    {
         WriteDone();
+        goto quit;
+    }
 
-    if (c == C_SKIP || c == C_NONE)
+    if (c != C_106 && c != C_101 && c != C_OTHER)
         goto quit;
 
     if (Apply(c))
@@ -322,6 +352,7 @@ VOID NTAPI NtProcessStartup(PPEB Peb)
     else
     {
         Print(L"\n  Failed to write the registry.\n");
+        Delay(3000);
     }
 
 quit:
