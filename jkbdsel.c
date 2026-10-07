@@ -22,6 +22,7 @@
 #include <windef.h>
 #include <winbase.h>
 #include <winnt.h>
+#include <winreg.h>
 #include <wchar.h>
 #define NTOS_MODE_USER
 #include <ndk/ntndk.h>
