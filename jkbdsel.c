@@ -81,6 +81,31 @@ static void DelValue(HANDLE h, PCWSTR name)
     NtDeleteValueKey(h, &n);
 }
 
+static BOOLEAN FileExists(PCWSTR path)
+{
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    HANDLE h;
+    NTSTATUS st;
+
+    RtlInitUnicodeString(&name, path);
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    st = NtCreateFile(&h, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &oa, &iosb,
+                      NULL, FILE_ATTRIBUTE_NORMAL,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (NT_SUCCESS(st))
+        NtClose(h);
+    return NT_SUCCESS(st);
+}
+
+static BOOLEAN IsUnattended(void)
+{
+    return FileExists(L"\\SystemRoot\\unattend.inf") ||
+           FileExists(L"\\SystemRoot\\system32\\unattend.inf");
+}
+
 #define NLS_LANG_KEY \
     L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Nls\\Language"
 
@@ -176,26 +201,59 @@ static BOOLEAN Apply(CHOICE c)
 }
 
 /* ---------- Key Input ---------- */
+
+#define WAIT_SECONDS 30
+
 static CHOICE WaitForChoice(void)
 {
     UNICODE_STRING name;
     OBJECT_ATTRIBUTES oa;
-    IO_STATUS_BLOCK iosb;
-    HANDLE hKbd;
+    IO_STATUS_BLOCK iosb, cancelIosb;
+    HANDLE hKbd = NULL, hEvent = NULL;
     KBD_INPUT_DATA kd;
+    LARGE_INTEGER deadline;
     NTSTATUS st;
+    CHOICE ret = C_SKIP;
 
     RtlInitUnicodeString(&name, L"\\Device\\KeyboardClass0");
     InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
     st = NtCreateFile(&hKbd, GENERIC_READ | SYNCHRONIZE, &oa, &iosb, NULL,
-                      FILE_ATTRIBUTE_NORMAL, 0, FILE_OPEN,
-                      FILE_DIRECTORY_FILE ? 0 : 0, NULL, 0);
+                      FILE_ATTRIBUTE_NORMAL,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE,
+                      FILE_OPEN, 0, NULL, 0);
     if (!NT_SUCCESS(st))
         return C_SKIP;
 
+    st = NtCreateEvent(&hEvent, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE);
+    if (!NT_SUCCESS(st))
+    {
+        NtClose(hKbd);
+        return C_SKIP;
+    }
+
+    NtQuerySystemTime(&deadline);
+    deadline.QuadPart += (LONGLONG)WAIT_SECONDS * 10000000LL;
+
     for (;;)
     {
-        st = NtReadFile(hKbd, NULL, NULL, NULL, &iosb, &kd, sizeof(kd), NULL, NULL);
+        NtResetEvent(hEvent, NULL);
+        st = NtReadFile(hKbd, hEvent, NULL, NULL, &iosb,
+                        &kd, sizeof(kd), NULL, NULL);
+
+        if (st == STATUS_PENDING)
+        {
+            st = NtWaitForSingleObject(hEvent, FALSE, &deadline);
+            if (st == STATUS_TIMEOUT)
+            {
+                NtCancelIoFile(hKbd, &cancelIosb);
+                NtWaitForSingleObject(hEvent, FALSE, NULL);
+                ret = C_SKIP;
+                break;
+            }
+            st = iosb.Status;
+        }
+
         if (!NT_SUCCESS(st))
             break;
         if ((kd.Flags & KEY_BREAK) || (kd.Flags & KEY_E0))
@@ -203,14 +261,17 @@ static CHOICE WaitForChoice(void)
 
         switch (kd.MakeCode)
         {
-            case 0x29: NtClose(hKbd); return C_106;    /* Hankaku/Zenkaku */
-            case 0x39: NtClose(hKbd); return C_101;    /* Space     */
-            case 0x1F: NtClose(hKbd); return C_OTHER;  /* S         */
-            case 0x3D: NtClose(hKbd); return C_SKIP;   /* F3        */
+            case 0x29: ret = C_106;   goto done; /* Hankaku/Zenkaku */
+            case 0x39: ret = C_101;   goto done; /* Space */
+            case 0x1F: ret = C_OTHER; goto done; /* S */
+            case 0x3D: ret = C_SKIP;  goto done; /* F3 */
         }
     }
+
+done:
+    NtClose(hEvent);
     NtClose(hKbd);
-    return C_SKIP;
+    return ret;
 }
 
 static void Reboot(void)
@@ -225,10 +286,7 @@ VOID NTAPI NtProcessStartup(PPEB Peb)
 {
     CHOICE c;
 
-    if (!IsJapaneseSystem())
-        goto quit;
-
-    if (IsDone())
+    if (!IsJapaneseSystem() || IsUnattended() || IsDone())
         goto quit;
 
     Print(L"\n\n  ReactOS Setup - Japanese Keyboard Type\n");
